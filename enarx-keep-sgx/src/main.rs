@@ -5,21 +5,20 @@
 #![deny(clippy::all)]
 #![deny(missing_docs)]
 
-mod builder;
-mod enclave;
 mod layout;
 
-use builder::{Builder, Segment};
-use enclave::Leaf;
 use loader::{segment, Component};
 
 use bounds::Span;
 use intel_types::Exception;
 use memory::Page;
 use sallyport::Block;
-use sgx::types::{
-    page::{Flags, SecInfo},
-    tcs::Tcs,
+use sgx::{
+    enclave::{Builder, Enclave, Leaf, Segment},
+    types::{
+        page::{Flags, SecInfo},
+        tcs::Tcs,
+    },
 };
 use structopt::StructOpt;
 
@@ -37,7 +36,7 @@ struct Opt {
     code: PathBuf,
 }
 
-fn load() -> enclave::Enclave {
+fn load() -> Enclave {
     let opt = Opt::from_args();
 
     // Parse the shim and code and validate assumptions.
@@ -124,7 +123,7 @@ fn load() -> enclave::Enclave {
     builder.load(&internal).unwrap();
     builder.load(&shim_segs).unwrap();
     builder.load(&code_segs).unwrap();
-    builder.done(layout.prefix.start).unwrap()
+    builder.build(layout.prefix.start).unwrap()
 }
 
 fn main() {
@@ -136,7 +135,7 @@ fn main() {
     //
     //   1. EEXIT events (including syscall proxying and ERESUMEs [CSSA--])
     //      are handled by the handler callback to the vDSO function. See
-    //      enclave.rs and enclave.S. This allows us to pass registers
+    //      `sgx/src/enclave/{enclave.rs, enclave.S}`. This allows us to pass registers
     //      directly to the syscall instruction.
     //
     //   2. Asynchronous exits (AEX) are handled here to minimize the amount
