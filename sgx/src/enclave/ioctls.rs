@@ -112,16 +112,14 @@ impl<'a> SetAttribute<'a> {
 mod test {
     use super::*;
 
-    use std::convert::TryFrom;
-    use std::fs::File;
-    use std::num::NonZeroU32;
+    use std::{fs::File, num::NonZeroU32};
 
     use crate::{
         crypto::{Hasher, Signer},
         types::{page::Flags as Perms, secs},
     };
     use bounds::Span;
-    use openssl::{bn, pkey, rsa};
+    use rsa::RSAPrivateKey;
     use rstest::*;
 
     #[fixture]
@@ -130,9 +128,14 @@ mod test {
     }
 
     #[fixture]
-    fn key() -> rsa::Rsa<pkey::Private> {
-        let e = bn::BigNum::try_from(3u32).unwrap();
-        rsa::Rsa::generate_with_e(3072, &e).unwrap()
+    fn key() -> RSAPrivateKey {
+        use num_traits::cast::FromPrimitive;
+        use rand::{rngs::StdRng, SeedableRng};
+        use rsa::BigUint;
+
+        let mut rng = StdRng::from_entropy();
+        let exp = BigUint::from_u32(3).unwrap();
+        RSAPrivateKey::new_with_exp(&mut rng, 3072, &exp).unwrap()
     }
 
     #[cfg_attr(not(has_sgx), ignore)]
@@ -146,7 +149,7 @@ mod test {
             Perms::R | Perms::W | Perms::X,
         ],
     )]
-    fn test(mut file: File, key: rsa::Rsa<pkey::Private>, flags: Flags, perms: Perms) {
+    fn test(mut file: File, key: RSAPrivateKey, flags: Flags, perms: Perms) {
         const SSA_PAGES: NonZeroU32 = unsafe { NonZeroU32::new_unchecked(1) };
         const BASE_ADDR: usize = 0x0000;
         const TCS_OFFSET: usize = 0x0000;
@@ -181,7 +184,7 @@ mod test {
 
         // Initialize the enclave.
         let author = sig::Author::new(0, 0);
-        let sig = key.sign(author, hasher.finish(None)).unwrap();
+        let sig = key.create_signature(author, hasher.finish(None)).unwrap();
         ENCLAVE_INIT.ioctl(&mut file, &Init::new(&sig)).unwrap();
     }
 }

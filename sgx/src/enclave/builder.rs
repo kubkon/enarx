@@ -9,13 +9,11 @@ use crate::{
     },
 };
 
+use anyhow::{anyhow, Context, Result};
 use bounds::Span;
 use memory::Page;
-use openssl::{bn, rsa};
 
-use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
-use std::io::Result;
 
 /// A loadable segment of code
 pub struct Segment {
@@ -67,12 +65,14 @@ impl Builder {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open("/dev/sgx/enclave")?;
+            .open("/dev/sgx/enclave")
+            .context("opening the enclave device")?;
 
         // Map the memory for the enclave
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE;
         let mmap = unsafe {
-            mmap::map(span.start, span.count, libc::PROT_NONE, flags, None, 0)?;
+            mmap::map(span.start, span.count, libc::PROT_NONE, flags, None, 0)
+                .context("mapping memory for the enclave")?;
             mmap::Unmap::new(span)
         };
 
@@ -83,7 +83,9 @@ impl Builder {
         let sign = Parameters::default();
         let secs = Secs::new(span, StateSaveArea::frame_size(), sign);
         let create = ioctls::Create::new(&secs);
-        ioctls::ENCLAVE_CREATE.ioctl(&mut file, &create)?;
+        ioctls::ENCLAVE_CREATE
+            .ioctl(&mut file, &create)
+            .context("creating enclave")?;
 
         Ok(Self {
             sign,
@@ -111,7 +113,9 @@ impl Builder {
 
             // Update the enclave.
             let mut ap = ioctls::AddPages::new(&seg.src, off, &seg.si, FLAGS);
-            ioctls::ENCLAVE_ADD_PAGES.ioctl(&mut self.file, &mut ap)?;
+            ioctls::ENCLAVE_ADD_PAGES
+                .ioctl(&mut self.file, &mut ap)
+                .context("adding new memory pages to enclave")?;
 
             // Update the hash.
             self.hash.add(&seg.src, off, seg.si, true);
@@ -135,17 +139,27 @@ impl Builder {
     ///
     /// TODO add more comprehensive docs.
     pub fn build(mut self, tcs: usize) -> Result<Enclave> {
+        use num_traits::cast::FromPrimitive;
+        use rand::{rngs::StdRng, SeedableRng};
+        use rsa::{BigUint, RSAPrivateKey};
+
         // Generate a signing key.
-        let exp = bn::BigNum::try_from(3u32)?;
-        let key = rsa::Rsa::generate_with_e(3072, &exp)?;
+        let mut rng = StdRng::from_entropy();
+        let exp = BigUint::from_u64(3).ok_or(anyhow!("generating public key exponent of 3"))?;
+        let key =
+            RSAPrivateKey::new_with_exp(&mut rng, 3072, &exp).context("generting signing key")?;
 
         // Create the enclave signature
         let vendor = Author::new(0, 0);
-        let sig = key.sign(vendor, self.hash.finish(self.sign))?;
+        let sig = key
+            .create_signature(vendor, self.hash.finish(self.sign))
+            .context("creating enclave signature")?;
 
         // Initialize the enclave.
         let init = ioctls::Init::new(&sig);
-        ioctls::ENCLAVE_INIT.ioctl(&mut self.file, &init)?;
+        ioctls::ENCLAVE_INIT
+            .ioctl(&mut self.file, &init)
+            .context("initializing the enclave")?;
 
         // Fix up mapped permissions.
         self.perm.sort_by(|l, r| l.0.start.cmp(&r.0.start));
@@ -165,7 +179,8 @@ impl Builder {
                     libc::MAP_SHARED | libc::MAP_FIXED,
                     Some(&self.file),
                     0,
-                )?;
+                )
+                .context("changing permissions on existing region of memory")?;
             }
 
             //let line = bounds::Line::from(span);

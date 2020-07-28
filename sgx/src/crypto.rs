@@ -8,11 +8,13 @@
 #![allow(clippy::unreadable_literal)]
 
 use crate::types::{page::SecInfo, sig};
-use memory::Page;
-use openssl::{bn, hash, pkey, rsa, sha, sign};
 
-use std::convert::TryInto;
-use std::io::Result;
+use anyhow::{anyhow, Context, Result};
+use memory::Page;
+use num_traits::cast::ToPrimitive;
+use rsa::{hash::Hash, padding, BigUint, PublicKeyParts, RSAPrivateKey};
+use sha2::{Digest, Sha256};
+
 use std::num::NonZeroU32;
 
 /// This struct creates and updates the MRENCLAVE value associated
@@ -21,7 +23,7 @@ use std::num::NonZeroU32;
 /// summarized at https://github.com/enarx/enarx/wiki/SGX-Measurement. The leaf
 /// functions are mimicked to obtain these values, but are not actually called here;
 /// to use them, refer to the [iocuddle-sgx](../../iocuddle-sgx) library.
-pub struct Hasher(sha::Sha256);
+pub struct Hasher(Sha256);
 
 impl Hasher {
     /// Mimics call to SGX_IOC_ENCLAVE_CREATE (ECREATE).
@@ -31,11 +33,11 @@ impl Hasher {
         // This value documented in 41.3.
         const ECREATE: u64 = 0x0045544145524345;
 
-        let mut sha256 = sha::Sha256::new();
+        let mut sha256 = Sha256::new();
         sha256.update(&ECREATE.to_le_bytes());
         sha256.update(&ssa_pages.get().to_le_bytes());
         sha256.update(&size.to_le_bytes());
-        sha256.update(&[0u8; 44]); // Reserved
+        sha256.update(&[0u8; 44][..]); // Reserved
 
         Self(sha256)
     }
@@ -66,7 +68,7 @@ impl Hasher {
 
                     self.0.update(&EEXTEND.to_le_bytes());
                     self.0.update(&(off as u64).to_le_bytes());
-                    self.0.update(&[0u8; 48]);
+                    self.0.update(&[0u8; 48][..]);
                     self.0.update(segment);
                 }
             }
@@ -75,25 +77,22 @@ impl Hasher {
 
     /// Produces MRENCLAVE value by hashing with SHA256.
     pub fn finish(self, params: impl Into<Option<sig::Parameters>>) -> sig::Measurement {
-        params
-            .into()
-            .unwrap_or_default()
-            .measurement(self.0.finish())
+        let hash: [u8; 32] = self.0.finalize().into();
+        params.into().unwrap_or_default().measurement(hash)
     }
 }
 
 trait ToArray {
-    fn to_le_array(&self) -> Result<[u8; 384]>;
+    fn to_array_le(&self) -> [u8; 384];
 }
 
-impl ToArray for bn::BigNumRef {
-    #[allow(clippy::uninit_assumed_init)]
-    fn to_le_array(&self) -> Result<[u8; 384]> {
-        use std::mem::MaybeUninit;
-
-        let mut buf: [u8; 384] = unsafe { MaybeUninit::uninit().assume_init() };
-        self.to_le_bytes(&mut buf)?;
-        Ok(buf)
+impl ToArray for BigUint {
+    fn to_array_le(&self) -> [u8; 384] {
+        let mut buf = [0u8; 384];
+        for (i, b) in self.to_bytes_le().into_iter().enumerate() {
+            buf[i] = b;
+        }
+        buf
     }
 }
 
@@ -102,11 +101,19 @@ impl ToArray for bn::BigNumRef {
 /// This is documented in 38.13.
 pub trait Signer: Sized {
     /// Create an enclave signature
-    fn sign(&self, author: sig::Author, measurement: sig::Measurement) -> Result<sig::Signature>;
+    fn create_signature(
+        &self,
+        author: sig::Author,
+        measurement: sig::Measurement,
+    ) -> Result<sig::Signature>;
 }
 
-impl Signer for rsa::Rsa<pkey::Private> {
-    fn sign(&self, author: sig::Author, measurement: sig::Measurement) -> Result<sig::Signature> {
+impl Signer for RSAPrivateKey {
+    fn create_signature(
+        &self,
+        author: sig::Author,
+        measurement: sig::Measurement,
+    ) -> Result<sig::Signature> {
         let a = unsafe {
             core::slice::from_raw_parts(
                 &author as *const _ as *const u8,
@@ -122,32 +129,36 @@ impl Signer for rsa::Rsa<pkey::Private> {
         };
 
         // Generates signature on Signature author and contents
-        let rsa_key = pkey::PKey::from_rsa(self.clone())?;
-        let md = hash::MessageDigest::sha256();
-        let mut signer = sign::Signer::new(md, &rsa_key)?;
-        signer.update(a)?;
-        signer.update(c)?;
-        let signature = signer.sign_to_vec()?;
+        let mut md = Sha256::new();
+        md.update(a);
+        md.update(c);
+        let signature = self
+            .sign(
+                padding::PaddingScheme::new_pkcs1v15_sign(Some(Hash::SHA2_256)),
+                md.finalize().as_slice(),
+            )
+            .context("signing author and contents")?;
 
         // Generates q1, q2 values for RSA signature verification
-        let s = bn::BigNum::from_be_bytes(&signature)?;
-        let m = self.n();
+        let s = BigUint::from_bytes_be(&signature);
+        let pub_key: rsa::RSAPublicKey = self.into();
+        let m = pub_key.n();
 
-        let mut ctx = bn::BigNumContext::new()?;
-        let mut q1 = bn::BigNum::new()?;
-        let mut qr = bn::BigNum::new()?;
-
-        q1.div_rem(&mut qr, &(&s * &s), &m, &mut ctx)?;
-        let q2 = &(&s * &qr) / m;
+        let q1 = (&s * &s) / m;
+        let qr = (&s * &s) % m;
+        let q2 = (&s * qr) / m;
 
         Ok(sig::Signature::new(
             author,
             measurement,
-            self.e().try_into()?,
-            m.to_le_array()?,
-            s.to_le_array()?,
-            q1.to_le_array()?,
-            q2.to_le_array()?,
+            pub_key
+                .e()
+                .to_u32()
+                .ok_or(anyhow!("pubkey exponent doesn't fit in u32"))?,
+            m.to_array_le(),
+            s.to_array_le(),
+            q1.to_array_le(),
+            q2.to_array_le(),
         ))
     }
 }
@@ -301,9 +312,17 @@ mod test {
         sig
     }
 
-    fn loadkey(path: &str) -> rsa::Rsa<pkey::Private> {
-        let pem = load(path);
-        rsa::Rsa::private_key_from_pem(&pem).unwrap()
+    fn loadkey(path: &str) -> RSAPrivateKey {
+        let pem_encoded = String::from_utf8(load(path))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("-"))
+            .fold(String::new(), |mut data, line| {
+                data.push_str(&line);
+                data
+            });
+        let pem_decoded = base64::decode(&pem_encoded).unwrap();
+        RSAPrivateKey::from_pkcs1(&pem_decoded).unwrap()
     }
 
     #[test]
@@ -336,7 +355,8 @@ mod test {
         // Ensure that sign() can reproduce the exact same signature struct.
         assert_eq!(
             sig,
-            key.sign(sig.author(), sig.measurement()).unwrap(),
+            key.create_signature(sig.author(), sig.measurement())
+                .unwrap(),
             "failed to produce correct signature"
         );
     }
